@@ -1,0 +1,16 @@
+.git/
+.venv/
+.agents/
+.github/
+__pycache__/
+**/__pycache__/
+*.egg-info/
+build/
+dist/
+output/
+tests/
+codex-plugin/
+data/*_reference.jsonl
+Start-ModelTrace.*
+*.log
+.env*

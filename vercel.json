@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "flask",
+  "installCommand": "python -m pip install -r requirements.txt",
+  "buildCommand": "python build_web.py",
+  "functions": {
+    "app.py": { "maxDuration": 90 }
+  }
+}

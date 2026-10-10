@@ -4,3 +4,16 @@ __pycache__/
 *.log
 .venv/
 node_modules/
+public/
+build/
+dist/
+*.egg-info/
+.vercel/
+.env*
+output/
+
+# Local acceptance and deployment records.
+ACCEPTANCE.md
+HANDOVER.md
+ONLINE.md
+tests/package_delivery.py

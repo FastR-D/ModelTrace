@@ -4,16 +4,50 @@ ModelTrace 是一个本地运行的主动模型归因工具。它通过三条独
 
 ## 运行
 
+Windows 本地使用可双击 `Start-ModelTrace.cmd`。首次启动会在本目录建立 `.venv` 并安装依赖，随后自动打开浏览器。关闭命令窗口或按 Ctrl+C 即停止服务。手动方式：
+
 ```powershell
-python -m pip install -r requirements.txt
-python start.py
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe start.py
 ```
 
 页面地址为 `http://127.0.0.1:7860/`。
+在页面选择“API 自动测试”并填写兼容 OpenAI Chat Completions 或 Anthropic Messages 的接口地址、API Key 和模型名，即可自动完成三次挑战与归因，无需复制粘贴。没有模型接口时，仍可用“手动测试”；项目附带的本地模拟接口测试不代表真实模型准确率。
+
+本地功能自检：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
 ## GitHub Pages
 
 `static/index.html` 是不依赖后端的手动测试版本，归因计算和指纹库读取都在浏览器本地完成。仓库附带的 GitHub Actions 会将 `static/` 部署到 GitHub Pages。
+
+## Vercel API 测试网页
+
+已提供 `vercel.json`、Python 版本设置和静态资源构建脚本。云端首页直接显示 API 自动测试，支持 OpenAI Chat Completions、Responses 和 Anthropic Messages。Token 只在本次请求中转发；云端指纹库只读。
+
+具体部署和环境变量见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
+## Python 指纹库
+
+在本仓库中执行 `python -m pip install .` 安装 `modeltrace`，或执行 `python -m build` 构建可供服务器离线安装的 wheel。运行库仅依赖 NumPy，不需要启动 Flask。wheel 包含当前统一候选库。
+
+```python
+from modeltrace import check_api
+
+result = check_api(
+    base_url="https://api.example.com/v1",
+    api_key="YOUR_TOKEN",
+    api_model="YOUR_MODEL",
+    api_format="responses",  # openai / anthropic / auto 也可使用
+)
+print(result["prediction_name"], result["probability"])
+```
+
+另提供 `analyze_outputs`、`generate_challenges`、`load_bank` 和逐条调用的 `probe_api`。自动测试需三条有效回答才返回成功；上游授权失败、限流和超时会抛出 `APIError`。`cc-switch-simple` 的 `check` 命令直接调用这个库，不依赖网页在线。
 
 ## 使用
 

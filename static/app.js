@@ -3,9 +3,37 @@ const state = {
   bankId: window.DEFAULT_BANK_ID,
   bank: window.BANK_SUMMARIES[window.DEFAULT_BANK_ID],
   unified: window.UNIFIED_SUMMARY,
+  pendingApiAnalysis: null,
+  pendingApiCollection: null,
+  apiTestRunning: false,
 };
 
 const byId = (id) => document.getElementById(id);
+
+async function fetchJson(url, options = {}) {
+  let response;
+  try {
+    response = await fetch(url, { ...options, signal: AbortSignal.timeout(85000) });
+  } catch (cause) {
+    const timedOut = ["TimeoutError", "AbortError"].includes(cause.name);
+    const error = new Error(timedOut
+      ? "连接本页面的服务超时，请稍后重试。"
+      : "无法连接本页面的服务，请检查网络连接；本地使用时请确认服务窗口仍在运行。");
+    error.retryable = true;
+    throw error;
+  }
+  let payload;
+  try { payload = await response.json(); }
+  catch { throw new Error(`服务返回非 JSON 内容（HTTP ${response.status}），请稍后重试`); }
+  if (!response.ok) {
+    const error = new Error(payload.error || `请求失败（HTTP ${response.status}）`);
+    error.httpStatus = response.status;
+    error.upstreamStatus = payload.upstream_status;
+    error.retryable = payload.retryable;
+    throw error;
+  }
+  return payload;
+}
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, (character) => ({
@@ -44,10 +72,11 @@ async function loadChallenges() {
   byId("regenerate").disabled = true;
   byId("result").hidden = true;
   setMessage(byId("test-message"), "");
-  const response = await fetch("/api/challenges");
-  state.challenges = (await response.json()).challenges;
-  renderChallenges();
-  byId("regenerate").disabled = false;
+  try {
+    state.challenges = (await fetchJson("/api/challenges")).challenges;
+    renderChallenges();
+  } catch (error) { setMessage(byId("test-message"), error.message); }
+  finally { byId("regenerate").disabled = false; }
 }
 
 function renderChallenges() {
@@ -114,13 +143,12 @@ async function analyzeManual() {
     text: byId(`output-${index}`).value,
     expected_count: challenge.expected_count,
   }));
-  const response = await fetch("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ outputs }) });
-  const payload = await response.json();
-  if (response.ok) {
+  try {
+    const payload = await fetchJson("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ outputs }) });
     setMessage(byId("test-message"), "");
     renderResult(payload);
-  } else {
-    setMessage(byId("test-message"), payload.error || "无法完成归因。", "error");
+  } catch (error) {
+    setMessage(byId("test-message"), error.message, "error");
     byId("result").hidden = true;
   }
   button.disabled = false;
@@ -140,34 +168,70 @@ function renderApiProgress(states, status) {
   }).join("");
 }
 
-async function testViaApi(event) {
-  event.preventDefault();
-  const button = event.currentTarget.querySelector("button[type=submit]");
-  button.disabled = true;
-  byId("result").hidden = true;
+async function retryApiAnalysis() {
+  const pending = state.pendingApiAnalysis;
+  if (!pending) return;
+  const retryButton = byId("retry-api-analysis");
+  const testButton = byId("api-test-form").querySelector("button[type=submit]");
+  retryButton.disabled = true;
+  testButton.disabled = true;
   setMessage(byId("test-message"), "");
+  renderApiProgress(pending.states, "模型回答已收齐，正在计算归因概率……");
+  try {
+    const result = await fetchJson("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ outputs: pending.outputs }),
+    });
+    const attempted = pending.states.filter((item) => ["done", "invalid", "error"].includes(item)).length;
+    result.api_test = {
+      requested: 3, attempted, max_attempts: pending.states.length,
+      received: pending.outputs.length, errors: pending.errors,
+    };
+    renderResult(result);
+    renderApiProgress(pending.states, `测试完成：${pending.outputs.length}/3 份有效回答进入归因`);
+    state.pendingApiAnalysis = null;
+    retryButton.hidden = true;
+  } catch (error) {
+    renderApiProgress(pending.states, "归因计算未完成，已保留本次回答，可重试归因");
+    setMessage(byId("test-message"), `${error.message} 三份回答已保留在当前页面内存中，点击“重试归因”即可，不会再次调用模型接口；请暂时不要刷新页面。`, "error");
+    retryButton.hidden = false;
+  } finally {
+    retryButton.disabled = false;
+    testButton.disabled = false;
+  }
+}
 
-  const challengeResponse = await fetch("/api/challenges");
-  const firstBatch = (await challengeResponse.json()).challenges;
-  const retryResponse = await fetch("/api/challenges");
-  const challenges = firstBatch.concat((await retryResponse.json()).challenges);
-  const states = challenges.map(() => "pending");
-  const outputs = [];
-  const errors = [];
-  const target = 3;
-  const configuration = {
-    base_url: byId("test-api-base").value,
-    api_key: byId("test-api-key").value,
-    api_model: byId("test-api-model").value,
+function apiTestConfiguration() {
+  return {
+    base_url: byId("test-api-base").value.trim().replace(/\/+$/, ""),
+    api_model: byId("test-api-model").value.trim(),
     temperature: optionalNumber("test-temperature"),
+    api_format: byId("test-api-format").value,
   };
-  renderApiProgress(states, "已生成独立挑战，准备调用模型");
+}
 
-  for (let index = 0; index < challenges.length && outputs.length < target; index += 1) {
+function showPendingCollection(pending) {
+  const remaining = 3 - pending.outputs.length;
+  const button = byId("continue-api-test");
+  button.hidden = false;
+  button.textContent = `继续采集（还缺 ${remaining} 份）`;
+  byId("api-test-form").querySelector("button[type=submit]").textContent = "开始新测试";
+  renderApiProgress(pending.states, `采集暂停：已保留 ${pending.outputs.length}/3 份有效回答`);
+  setMessage(byId("test-message"), `${pending.errors.at(-1) || "未收齐三份有效回答。"} 已保留 ${pending.outputs.length} 份回答，可稍后继续采集；继续会调用模型接口并可能消耗额度，请不要刷新页面。`, "error");
+}
+
+async function collectApiAnswers(pending) {
+  const { challenges, states, outputs, errors } = pending;
+  const configuration = { ...pending.configuration, api_key: byId("test-api-key").value.trim(), api_format: pending.apiFormat };
+  let consecutiveFailures = 0;
+
+  for (let index = 0; index < challenges.length && outputs.length < 3; index += 1) {
+    if (states[index] !== "pending") continue;
     states[index] = "working";
     renderApiProgress(states, `正在进行第 ${index + 1} 次尝试，等待模型完整输出……`);
     try {
-      const response = await fetch("/api/test/probe", {
+      const payload = await fetchJson("/api/test/probe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -176,8 +240,11 @@ async function testViaApi(event) {
           expected_count: challenges[index].expected_count,
         }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "接口请求失败");
+      consecutiveFailures = 0;
+      if (payload.api_format) {
+        configuration.api_format = payload.api_format;
+        pending.apiFormat = payload.api_format;
+      }
       if (payload.accepted) {
         outputs.push({ text: payload.text, expected_count: challenges[index].expected_count });
         states[index] = "done";
@@ -188,37 +255,82 @@ async function testViaApi(event) {
     } catch (error) {
       errors.push(`尝试 ${index + 1}: ${error.message}`);
       states[index] = "error";
+      consecutiveFailures += 1;
+      if ([400, 401, 403, 404, 405, 415, 429].includes(error.upstreamStatus) || [400, 403, 413, 415].includes(error.httpStatus)) break;
+      if (consecutiveFailures >= 3) break;
     }
-    renderApiProgress(states, `当前已有 ${outputs.length}/${target} 份有效回答`);
+    renderApiProgress(states, `当前已有 ${outputs.length}/3 份有效回答`);
   }
 
-  if (outputs.length === target) {
-    states.forEach((state, index) => { if (state === "pending") states[index] = "skipped"; });
-  }
-
-  if (!outputs.length) {
-    renderApiProgress(states, "六次尝试后仍没有可用回答");
-    setMessage(byId("test-message"), `没有获得可分析输出。${errors[0] || ""}`, "error");
-    button.disabled = false;
+  if (outputs.length < 3) {
+    showPendingCollection(pending);
     return;
   }
 
-  renderApiProgress(states, "模型回答已收齐，正在计算归因概率……");
-  const analysisResponse = await fetch("/api/analyze", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ outputs }),
-  });
-  const result = await analysisResponse.json();
-  if (analysisResponse.ok) {
-    const attempted = states.filter((state) => ["done", "invalid", "error"].includes(state)).length;
-    result.api_test = { requested: target, attempted, max_attempts: challenges.length, received: outputs.length, errors };
-    renderApiProgress(states, `测试完成：${outputs.length}/${target} 份有效回答进入归因`);
-    renderResult(result);
-  } else {
-    setMessage(byId("test-message"), result.error || "API 自动测试失败。", "error");
+  states.forEach((item, index) => { if (item === "pending") states[index] = "skipped"; });
+  state.pendingApiCollection = null;
+  byId("continue-api-test").hidden = true;
+  byId("api-test-form").querySelector("button[type=submit]").textContent = "开始测试";
+  state.pendingApiAnalysis = { outputs, states, errors };
+  await retryApiAnalysis();
+}
+
+async function continueApiTest() {
+  const pending = state.pendingApiCollection;
+  if (!pending || state.apiTestRunning) return;
+  if (JSON.stringify(apiTestConfiguration()) !== JSON.stringify(pending.configuration)) {
+    setMessage(byId("test-message"), "接口、模型、温度或协议已改变，不能混用之前的回答。恢复原设置后继续采集，或点击“开始新测试”。", "error");
+    return;
   }
-  button.disabled = false;
+  if (!byId("test-api-key").value.trim()) {
+    setMessage(byId("test-message"), "请填写 API Key 后继续采集。", "error");
+    return;
+  }
+  const button = byId("api-test-form").querySelector("button[type=submit]");
+  state.apiTestRunning = true;
+  button.disabled = true;
+  byId("continue-api-test").disabled = true;
+  setMessage(byId("test-message"), "");
+  try {
+    if (!pending.states.includes("pending")) {
+      const nextBatch = (await fetchJson("/api/challenges")).challenges;
+      pending.challenges.push(...nextBatch);
+      pending.states.push(...nextBatch.map(() => "pending"));
+    }
+    await collectApiAnswers(pending);
+  } catch (error) {
+    pending.errors.push(error.message);
+    showPendingCollection(pending);
+  } finally {
+    state.apiTestRunning = false;
+    button.disabled = false;
+    byId("continue-api-test").disabled = false;
+  }
+}
+
+async function testViaApi(event) {
+  event.preventDefault();
+  if (state.apiTestRunning) return;
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  state.apiTestRunning = true;
+  button.disabled = true;
+  button.textContent = "开始测试";
+  byId("result").hidden = true;
+  setMessage(byId("test-message"), "");
+  state.pendingApiAnalysis = null;
+  state.pendingApiCollection = null;
+  byId("retry-api-analysis").hidden = true;
+  byId("continue-api-test").hidden = true;
+  try {
+    const configuration = apiTestConfiguration();
+    const firstBatch = (await fetchJson("/api/challenges")).challenges;
+    const challenges = firstBatch.concat((await fetchJson("/api/challenges")).challenges);
+    const pending = { challenges, states: challenges.map(() => "pending"), outputs: [], errors: [], configuration, apiFormat: configuration.api_format };
+    state.pendingApiCollection = pending;
+    renderApiProgress(pending.states, "已生成独立挑战，准备调用模型");
+    await collectApiAnswers(pending);
+  } catch (error) { setMessage(byId("test-message"), error.message, "error"); }
+  finally { state.apiTestRunning = false; button.disabled = false; }
 }
 
 function updateUnifiedSummary(summary) {
@@ -330,9 +442,11 @@ byId("bank-select").addEventListener("change", (event) => selectBank(event.targe
 byId("regenerate").addEventListener("click", loadChallenges);
 byId("analyze").addEventListener("click", analyzeManual);
 byId("api-test-form").addEventListener("submit", testViaApi);
-byId("auto-enrollment").addEventListener("submit", enrollAutomatically);
-byId("show-create-bank").addEventListener("click", () => { byId("create-bank-form").hidden = !byId("create-bank-form").hidden; });
-byId("create-bank-form").addEventListener("submit", createBank);
+byId("retry-api-analysis").addEventListener("click", retryApiAnalysis);
+byId("continue-api-test").addEventListener("click", continueApiTest);
+byId("auto-enrollment")?.addEventListener("submit", enrollAutomatically);
+byId("show-create-bank")?.addEventListener("click", () => { byId("create-bank-form").hidden = !byId("create-bank-form").hidden; });
+byId("create-bank-form")?.addEventListener("submit", createBank);
 
 renderInventory();
 loadChallenges();

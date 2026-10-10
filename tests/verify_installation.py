@@ -20,7 +20,7 @@ def verify_installed(expected_sha, with_switcher):
 
     package = Path(modeltrace.__file__).resolve()
     assert package.is_relative_to(Path(sys.prefix).resolve()), package
-    bank = fingerprint.DEFAULT_BANK
+    bank = fingerprint.DEFAULT_BANK.resolve(strict=True)
     assert bank.is_relative_to(package.parent), bank
     assert hashlib.sha256(bank.read_bytes()).hexdigest() == expected_sha
     model_ids = {item["id"] for item in modeltrace.load_bank()["models"]}
@@ -127,7 +127,7 @@ def main():
     environment = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
     environment.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     with tempfile.TemporaryDirectory(prefix="modeltrace-install-") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         venv.EnvBuilder(with_pip=True).create(root / "env")
         binary = root / "env" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         outside = root / "outside"
